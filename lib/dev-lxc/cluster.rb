@@ -2,7 +2,7 @@ require "dev-lxc/server"
 
 module DevLXC
   class Cluster
-    attr_reader :api_fqdn, :analytics_fqdn, :chef_server_bootstrap_backend, :analytics_bootstrap_backend, :lxc_config_path
+    attr_reader :api_fqdn, :chef_server_bootstrap_backend, :analytics_fqdn, :analytics_bootstrap_backend, :compliance_fqdn, :supermarket_fqdn, :lxc_config_path
 
     def initialize(cluster_config)
       @cluster_config = cluster_config
@@ -16,6 +16,7 @@ module DevLXC
 
       if @cluster_config["chef-server"]
         @chef_server_topology = @cluster_config["chef-server"]["topology"]
+        @chef_server_topology ||= 'standalone'
         @api_fqdn = @cluster_config["chef-server"]["api_fqdn"]
         @chef_server_servers = @cluster_config["chef-server"]["servers"]
         @chef_server_frontends = Array.new
@@ -23,6 +24,7 @@ module DevLXC
           case @chef_server_topology
           when 'open-source', 'standalone'
             @chef_server_bootstrap_backend = name if config["role"].nil?
+            @api_fqdn ||= @chef_server_bootstrap_backend
           when 'tier'
             @chef_server_bootstrap_backend = name if config["role"] == "backend" && config["bootstrap"] == true
             @chef_server_frontends << name if config["role"] == "frontend"
@@ -32,6 +34,7 @@ module DevLXC
 
       if @cluster_config["analytics"]
         @analytics_topology = @cluster_config["analytics"]["topology"]
+        @analytics_topology ||= 'standalone'
         @analytics_fqdn = @cluster_config["analytics"]["analytics_fqdn"]
         @analytics_servers = @cluster_config["analytics"]["servers"]
         @analytics_frontends = Array.new
@@ -39,10 +42,25 @@ module DevLXC
           case @analytics_topology
           when 'standalone'
             @analytics_bootstrap_backend = name if config["role"].nil?
+            @analytics_fqdn ||= @analytics_bootstrap_backend
           when 'tier'
             @analytics_bootstrap_backend = name if config["role"] == "backend" && config["bootstrap"] == true
             @analytics_frontends << name if config["role"] == "frontend"
           end
+        end
+      end
+
+      if @cluster_config["compliance"]
+        compliance_servers = @cluster_config["compliance"]["servers"]
+        compliance_servers.each_key do |name|
+          @compliance_fqdn = name
+        end
+      end
+
+      if @cluster_config["supermarket"]
+        supermarket_servers = @cluster_config["supermarket"]["servers"]
+        supermarket_servers.each_key do |name|
+          @supermarket_fqdn = name
         end
       end
     end
@@ -69,6 +87,9 @@ module DevLXC
         end
       end
       servers = adhoc_servers + chef_servers + analytics_servers
+      servers << Server.new(@compliance_fqdn, 'compliance', @cluster_config) if @compliance_fqdn
+      servers << Server.new(@supermarket_fqdn, 'supermarket', @cluster_config) if @supermarket_fqdn
+      servers
     end
 
     def chef_repo(force=false, pivotal=false)
@@ -98,8 +119,8 @@ module DevLXC
         validator_name = "chef-validator"
       else
         chef_server_root = "https://#{@api_fqdn}"
-        chef_server_url = "https://#{@api_fqdn}/organizations/ponyville"
-        validator_name = "ponyville-validator"
+        chef_server_url = "https://#{@api_fqdn}/organizations/demo"
+        validator_name = "demo-validator"
 
         if pivotal
           if File.exists?("./chef-repo/.chef/pivotal.rb") && ! force
@@ -153,6 +174,24 @@ server "#{frontend_name}",
   :role => "frontend"
 )
         end
+      end
+      if @analytics_fqdn
+        chef_server_config += %Q(
+oc_id['applications'] ||= {}
+oc_id['applications']['analytics'] = {
+  'redirect_uri' => 'https://#{@analytics_fqdn}/'
+}
+rabbitmq['vip'] = '#{@chef_server_bootstrap_backend}'
+rabbitmq['node_ip_address'] = '0.0.0.0'
+)
+      end
+      if @supermarket_fqdn
+        chef_server_config += %Q(
+oc_id['applications'] ||= {}
+oc_id['applications']['supermarket'] = {
+  'redirect_uri' => 'https://#{@supermarket_fqdn}/auth/chef_oauth2/callback'
+}
+)
       end
       return chef_server_config
     end

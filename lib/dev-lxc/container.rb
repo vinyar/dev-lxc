@@ -47,27 +47,42 @@ module DevLXC
       existing_mounts = self.config_item("lxc.mount.entry")
       unless existing_mounts.nil?
         preserved_mounts = existing_mounts.delete_if { |m| m.end_with?("## dev-lxc ##") }
-        # self.clear_config_item('lxc.mount.entries') doesn't work as of liblxc 1.1.2 and at least up to 1.1.5-0ubuntu3~ubuntu15.04.1~ppa1
-        # reference: https://github.com/lxc/lxc/issues/712
-        DevLXC.search_file_delete_line(self.config_file_name, /^lxc.mount.entry/)
-        self.clear_config
-        self.load_config
+        self.clear_config_item('lxc.mount.entry')
         self.set_config_item("lxc.mount.entry", preserved_mounts)
       end
-      mounts.each do |mount|
-        unless File.exists?(mount.split.first)
-          puts "ERROR: Mount source #{mount.split.first} does not exist."
-          exit 1
-        end
-        if ! preserved_mounts.nil? && preserved_mounts.any? { |m| m.start_with?("#{mount} ") }
-          puts "Skipping mount entry #{mount}, it already exists"
-          next
-        else
-          puts "Adding mount entry #{mount}"
-          self.set_config_item("lxc.mount.entry", "#{mount} none bind,optional,create=dir 0 0     ## dev-lxc ##")
+      unless mounts.nil?
+        mounts.each do |mount|
+          if ! preserved_mounts.nil? && preserved_mounts.any? { |m| m.start_with?("#{mount} ") }
+            puts "Skipping mount entry #{mount}, it already exists"
+            next
+          else
+            puts "Adding mount entry #{mount}"
+            self.set_config_item("lxc.mount.entry", "#{mount} none bind,optional,create=dir 0 0     ## dev-lxc ##")
+          end
         end
       end
       self.save_config
+    end
+
+    def sync_ssh_keys(ssh_keys)
+      dot_ssh_path = "/home/dev-lxc/.ssh"
+      unless File.exist?("#{config_item('lxc.rootfs')}#{dot_ssh_path}/authorized_keys")
+        run_command("sudo -u dev-lxc mkdir -p #{dot_ssh_path}")
+        run_command("sudo -u dev-lxc chmod 700 #{dot_ssh_path}")
+        run_command("sudo -u dev-lxc touch #{dot_ssh_path}/authorized_keys")
+        run_command("sudo -u dev-lxc chmod 600 #{dot_ssh_path}/authorized_keys")
+      end
+      authorized_keys = IO.read("#{config_item('lxc.rootfs')}#{dot_ssh_path}/authorized_keys").split("\n")
+      authorized_keys.delete_if { |m| m.end_with?("## dev-lxc ##") }
+      unless ssh_keys.nil?
+        ssh_keys.each do |ssh_key|
+          puts "Adding SSH key #{ssh_key} to #{dot_ssh_path}/authorized_keys"
+          authorized_keys << IO.read(ssh_key).chomp + "     ## dev-lxc ##"
+        end
+      end
+      authorized_keys_content = String.new
+      authorized_keys_content = authorized_keys.join("\n") + "\n" unless authorized_keys.empty?
+      IO.write("#{config_item('lxc.rootfs')}#{dot_ssh_path}/authorized_keys", authorized_keys_content)
     end
 
     def run_command(command)

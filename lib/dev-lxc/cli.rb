@@ -6,6 +6,59 @@ module DevLXC::CLI
   class DevLXC < Thor
 
     no_commands{
+      def validate_cluster_config(cluster_config)
+        hostnames = Array.new
+        mounts = Array.new
+        packages = Array.new
+        ssh_keys = Array.new
+
+        mounts.concat(cluster_config['mounts']) unless cluster_config['mounts'].nil?
+        ssh_keys.concat(cluster_config['ssh-keys']) unless cluster_config['ssh-keys'].nil?
+
+        %w(chef-server analytics compliance supermarket adhoc).each do |server_type|
+          unless cluster_config[server_type].nil?
+            hostnames << cluster_config[server_type]['api_fqdn'] unless cluster_config[server_type]['api_fqdn'].nil?
+            hostnames << cluster_config[server_type]['analytics_fqdn'] unless cluster_config[server_type]['analytics_fqdn'].nil?
+            hostnames.concat(cluster_config[server_type]['servers'].keys) unless cluster_config[server_type]['servers'].nil?
+            mounts.concat(cluster_config[server_type]['mounts']) unless cluster_config[server_type]['mounts'].nil?
+            packages.concat(cluster_config[server_type]['packages'].values) unless cluster_config[server_type]['packages'].nil?
+            ssh_keys.concat(cluster_config[server_type]['ssh-keys']) unless cluster_config[server_type]['ssh-keys'].nil?
+          end
+        end
+        unless hostnames.empty?
+          hostnames.each do |hostname|
+            unless hostname.end_with?(".lxc")
+              puts "ERROR: Hostname #{hostname} does not end with '.lxc'."
+              exit 1
+            end
+          end
+        end
+        unless mounts.empty?
+          mounts.each do |mount|
+            unless File.exists?(mount.split.first)
+              puts "ERROR: Mount source #{mount.split.first} does not exist."
+              exit 1
+            end
+          end
+        end
+        unless packages.empty?
+          packages.each do |package|
+            unless File.exists?(package)
+              puts "ERROR: Package #{package} does not exist."
+              exit 1
+            end
+          end
+        end
+        unless ssh_keys.empty?
+          ssh_keys.each do |ssh_key|
+            unless File.exists?(ssh_key)
+              puts "ERROR: SSH key #{ssh_key} does not exist."
+              exit 1
+            end
+          end
+        end
+      end
+
       def get_cluster(config_file=nil)
         config_file ||= "dev-lxc.yml"
         if ! File.exists?(config_file)
@@ -13,7 +66,9 @@ module DevLXC::CLI
           puts "       Create a `./dev-lxc.yml` file or specify the path using `--config`."
           exit 1
         end
-        ::DevLXC::Cluster.new(YAML.load(IO.read(config_file)))
+        cluster_config = YAML.load(IO.read(config_file))
+        validate_cluster_config(cluster_config)
+        ::DevLXC::Cluster.new(cluster_config)
       end
 
       def match_server_name_regex(server_name_regex)
@@ -26,6 +81,7 @@ module DevLXC::CLI
     }
 
     desc "create [PLATFORM_IMAGE_NAME]", "Create a platform image"
+    option :options, :aliases => "-o", :desc => "Specify additional options for the lxc create"
     def create(platform_image_name=nil)
       start_time = Time.now
       platform_image_names = %w(p-ubuntu-1204 p-ubuntu-1404 p-ubuntu-1504 p-centos-5 p-centos-6 p-centos-7)
@@ -35,7 +91,7 @@ module DevLXC::CLI
         selection = ask("Which platform image do you want to create?", :limited_to => platform_image_names_with_index.map{|c| c[0].to_s})
         platform_image_name = platform_image_names[selection.to_i - 1]
       end
-      ::DevLXC.create_platform_image(platform_image_name)
+      ::DevLXC.create_platform_image(platform_image_name, options[:options])
       puts
       print_elapsed_time(Time.now - start_time)
     end
@@ -67,9 +123,9 @@ module DevLXC::CLI
           puts "ERROR: Can not copy validation key because Chef Server '#{chef_server_bootstrap_backend.name}' is not created."
           exit 1
         end
-        chef_server_url = "https://#{cluster.api_fqdn}/organizations/ponyville"
-        validation_client_name = 'ponyville-validator'
-        validation_key = "#{chef_server_bootstrap_backend.config_item('lxc.rootfs')}/root/chef-repo/.chef/ponyville-validator.pem"
+        chef_server_url = "https://#{cluster.api_fqdn}/organizations/demo"
+        validation_client_name = 'demo-validator'
+        validation_key = "#{chef_server_bootstrap_backend.config_item('lxc.rootfs')}/root/chef-repo/.chef/demo-validator.pem"
       elsif chef_server_url.nil? || validation_client_name.nil? || validation_key.nil?
         puts "ERROR: All of the --chef-server-url, --validation-client-name and --validation-key options must be set or left unset. Do not set only some of these options."
         exit 1
@@ -99,9 +155,9 @@ module DevLXC::CLI
           puts "ERROR: Can not copy validation key because Chef Server '#{chef_server_bootstrap_backend.name}' is not created."
           exit 1
         end
-        chef_server_url = "https://#{cluster.api_fqdn}/organizations/ponyville"
-        validation_client_name = 'ponyville-validator'
-        validation_key = "#{chef_server_bootstrap_backend.config_item('lxc.rootfs')}/root/chef-repo/.chef/ponyville-validator.pem"
+        chef_server_url = "https://#{cluster.api_fqdn}/organizations/demo"
+        validation_client_name = 'demo-validator'
+        validation_key = "#{chef_server_bootstrap_backend.config_item('lxc.rootfs')}/root/chef-repo/.chef/demo-validator.pem"
       elsif chef_server_url.nil? || validation_client_name.nil? || validation_key.nil?
         puts "ERROR: All of the --chef-server-url, --validation-client-name and --validation-key options must be set or left unset. Do not set only some of these options."
         exit 1
@@ -112,25 +168,126 @@ module DevLXC::CLI
       print_elapsed_time(Time.now - start_time)
     end
 
-    desc "init [TOPOLOGY] [UNIQUE_STRING]", "Provide a cluster config file with optional uniqueness in server names and FQDNs"
-    def init(topology=nil, unique_string=nil)
-      topologies = %w(adhoc open-source standalone tier)
-      if topology.nil? || ! topologies.include?(topology)
-        topologies_with_index = topologies.map.with_index{ |a, i| [i+1, *a]}
-        print_table topologies_with_index
-        selection = ask("Which cluster topology do you want to use?", :limited_to => topologies_with_index.map{|c| c[0].to_s})
-        topology = topologies[selection.to_i - 1]
-      end
-      config = IO.read("#{File.dirname(__FILE__)}/../../files/configs/#{topology}.yml")
+    desc "init [UNIQUE_STRING]", "Provide a cluster config file with optional uniqueness in server names and FQDNs"
+    option :open_source, :type => :boolean, :desc => "Standalone Old Open Source Chef Server"
+    option :tiered_chef, :type => :boolean, :desc => "Tiered Chef Server"
+    option :chef, :type => :boolean, :desc => "Standalone Chef Server"
+    option :analytics, :type => :boolean, :desc => "Analytics Server"
+    option :compliance, :type => :boolean, :desc => "Compliance Server"
+    option :supermarket, :type => :boolean, :desc => "Supermarket Server"
+    option :adhoc, :type => :boolean, :desc => "Adhoc Servers"
+    def init(unique_string=nil)
+      header = %Q(## platform_image can be one of the following:
+## p-centos-5, p-centos-6, p-centos-7, p-ubuntu-1204, p-ubuntu-1404 or p-ubuntu-1504
+platform_image: p-ubuntu-1404
+
+## platform_image_options can be set to provide additional arguments to the LXC create command
+## reference arg examples: https://github.com/lxc/lxc/blob/lxc-2.0.0/templates/lxc-download.in#L200-L207
+#platform_image_options: --no-validate
+
+## list any host directories you want mounted into the servers
+mounts:
+  - /root/dev root/dev
+
+## list any SSH public keys you want added to /home/dev-lxc/.ssh/authorized_keys
+#ssh-keys:
+#  - /root/dev/clusters/id_rsa.pub
+
+## DHCP reserved (static) IPs must be selected from the IP range 10.0.3.150 - 254
+)
+      open_source_packages = %Q(  packages:
+    server: /root/dev/chef-packages/osc/chef-server_11.1.6-1_amd64.deb
+)
+      chef_server_packages = %Q(  packages:
+    server: /root/dev/chef-packages/cs/chef-server-core_12.5.0-1_amd64.deb
+    manage: /root/dev/chef-packages/manage/chef-manage_2.2.1-1_amd64.deb
+    reporting: /root/dev/chef-packages/reporting/opscode-reporting_1.5.6-1_amd64.deb
+    push-jobs-server: /root/dev/chef-packages/push-jobs-server/opscode-push-jobs-server_1.1.6-1_amd64.deb
+)
+      analytics_packages = %Q(  packages:
+    analytics: /root/dev/chef-packages/analytics/opscode-analytics_1.3.1-1_amd64.deb
+)
+      compliance_packages = %Q(  packages:
+    compliance: /root/dev/chef-packages/compliance/chef-compliance_1.1.2-1_amd64.deb
+)
+      supermarket_packages = %Q(  packages:
+    supermarket: /root/dev/chef-packages/supermarket/supermarket_2.5.2-1_amd64.deb
+)
+      open_source_config = %Q(
+chef-server:
+#{open_source_packages.chomp}
+  api_fqdn: chef.lxc
+  topology: open-source
+  servers:
+    osc-chef.lxc:
+      ipaddress: 10.0.3.200
+)
+      tiered_chef_config = %Q(
+chef-server:
+#{chef_server_packages.chomp}
+  topology: tier
+  api_fqdn: chef.lxc
+  servers:
+    chef-be.lxc:
+      ipaddress: 10.0.3.201
+      role: backend
+      bootstrap: true
+    chef-fe1.lxc:
+      ipaddress: 10.0.3.202
+      role: frontend
+)
+      chef_config = %Q(
+chef-server:
+#{chef_server_packages.chomp}
+  servers:
+    chef.lxc:
+      ipaddress: 10.0.3.203
+)
+      analytics_config = %Q(
+analytics:
+#{analytics_packages.chomp}
+  servers:
+    analytics.lxc:
+      ipaddress: 10.0.3.204
+)
+      compliance_config = %Q(
+compliance:
+#{compliance_packages.chomp}
+  servers:
+    compliance.lxc:
+      ipaddress: 10.0.3.205
+)
+      supermarket_config = %Q(
+supermarket:
+#{supermarket_packages.chomp}
+  servers:
+    supermarket.lxc:
+      ipaddress: 10.0.3.206
+)
+      adhoc_config = %Q(
+adhoc:
+  servers:
+    adhoc.lxc:
+      ipaddress: 10.0.3.207
+)
+      config = header
+      config += open_source_config if options[:open_source]
+      config += chef_config if options[:chef]
+      config += tiered_chef_config if options[:tiered_chef]
+      config += analytics_config if options[:analytics]
+      config += compliance_config if options[:compliance]
+      config += supermarket_config if options[:supermarket]
+      config += adhoc_config if options[:adhoc]
       unless unique_string.nil?
         config_hash = YAML.load(config.gsub(/^#/, ''))
         config.gsub!(/api_fqdn:\s+#{config_hash['api_fqdn']}/, "api_fqdn: #{unique_string}#{config_hash['api_fqdn']}")
         config.gsub!(/analytics_fqdn:\s+#{config_hash['analytics_fqdn']}/, "analytics_fqdn: #{unique_string}#{config_hash['analytics_fqdn']}")
-        config_hash['chef-server']['servers'].keys.each do |server_name|
-          config.gsub!(/ #{server_name}:/, " #{unique_string}#{server_name}:")
-        end
-        config_hash['analytics']['servers'].keys.each do |server_name|
-          config.gsub!(/ #{server_name}:/, " #{unique_string}#{server_name}:")
+        %w(chef-server analytics compliance supermarket adhoc).each do |server_type|
+          if config_hash[server_type]
+            config_hash[server_type]['servers'].keys.each do |server_name|
+              config.gsub!(/ #{server_name}:/, " #{unique_string}#{server_name}:")
+            end
+          end
         end
       end
       puts config
@@ -148,8 +305,11 @@ module DevLXC::CLI
     option :config, :desc => "Specify a cluster's YAML config file. `./dev-lxc.yml` will be used by default"
     def status(server_name_regex=nil)
       cluster = get_cluster(options[:config])
-      puts "Chef Server: https://#{cluster.api_fqdn}\n\n" if cluster.api_fqdn
-      puts "Analytics:   https://#{cluster.analytics_fqdn}\n\n" if cluster.analytics_fqdn
+      puts "Chef Server FQDN: #{cluster.api_fqdn}\n" if cluster.api_fqdn
+      puts "Analytics FQDN:   #{cluster.analytics_fqdn}\n" if cluster.analytics_fqdn
+      puts "Compliance FQDN:  #{cluster.compliance_fqdn}\n" if cluster.compliance_fqdn
+      puts "Supermarket FQDN: #{cluster.supermarket_fqdn}\n" if cluster.supermarket_fqdn
+      puts
       servers = Array.new
       match_server_name_regex(server_name_regex).map { |s| servers << s.server.status }
       max_server_name_length = servers.max_by { |s| s['name'].length }['name'].length unless servers.empty?

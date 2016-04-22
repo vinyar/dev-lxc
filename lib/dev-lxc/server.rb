@@ -1,9 +1,10 @@
+require "json"
 require "dev-lxc/container"
 require "dev-lxc/cluster"
 
 module DevLXC
   class Server
-    attr_reader :server, :platform_image_name, :shared_image_name
+    attr_reader :server, :platform_image_name, :platform_image_options, :shared_image_name
 
     def initialize(name, server_type, cluster_config)
       unless cluster_config[server_type]["servers"].keys.include?(name)
@@ -15,6 +16,8 @@ module DevLXC
       @lxc_config_path = cluster.lxc_config_path
       @api_fqdn = cluster.api_fqdn
       @analytics_fqdn = cluster.analytics_fqdn
+      @compliance_fqdn = cluster.compliance_fqdn
+      @supermarket_fqdn = cluster.supermarket_fqdn
       @chef_server_bootstrap_backend = cluster.chef_server_bootstrap_backend
       @analytics_bootstrap_backend = cluster.analytics_bootstrap_backend
       @chef_server_config = cluster.chef_server_config
@@ -23,13 +26,21 @@ module DevLXC
       @server = DevLXC::Container.new(name, @lxc_config_path)
       @config = cluster_config[@server_type]["servers"][@server.name]
       @ipaddress = @config["ipaddress"]
-      @role = @config["role"] ? @config["role"] : cluster_config[@server_type]['topology']
+      @role = @config["role"]
+      @role ||= cluster_config[@server_type]['topology']
+      @role ||= 'standalone'
       @mounts = cluster_config[@server_type]["mounts"]
+      @mounts ||= cluster_config["mounts"]
+      @ssh_keys = cluster_config[@server_type]["ssh-keys"]
+      @ssh_keys ||= cluster_config["ssh-keys"]
       @platform_image_name = cluster_config[@server_type]["platform_image"]
+      @platform_image_name ||= cluster_config["platform_image"]
+      @platform_image_options = cluster_config[@server_type]["platform_image_options"]
+      @platform_image_options ||= cluster_config["platform_image_options"]
       @packages = cluster_config[@server_type]["packages"]
 
       case @server_type
-      when 'adhoc'
+      when 'adhoc', 'compliance', 'supermarket'
         @shared_image_name = ''
       when 'analytics'
         @shared_image_name = "s#{@platform_image_name[1..-1]}"
@@ -55,7 +66,6 @@ module DevLXC
         @shared_image_name += "-#{@chef_server_version}"
         @shared_image_name += "-reporting-#{Regexp.last_match[1].gsub(".", "-")}" if @packages["reporting"].to_s.match(/[_-]((\d+\.?){3,})/)
         @shared_image_name += "-pushy-#{Regexp.last_match[1].gsub(".", "-")}" if @packages["push-jobs-server"].to_s.match(/[_-]((\d+\.?){3,})/)
-        @shared_image_name += "-sync-#{Regexp.last_match[1].gsub(".", "-")}" if @packages["sync"].to_s.match(/[_-]((\d+\.?){3,})/)
       end
     end
 
@@ -82,10 +92,15 @@ module DevLXC
           DevLXC.create_dns_record(@analytics_fqdn, @server.name, @ipaddress)
         when 'chef-server'
           DevLXC.create_dns_record(@api_fqdn, @server.name, @ipaddress)
+        when 'compliance'
+          DevLXC.create_dns_record(@compliance_fqdn, @server.name, @ipaddress)
+        when 'supermarket'
+          DevLXC.create_dns_record(@supermarket_fqdn, @server.name, @ipaddress)
         end
       end
       @server.sync_mounts(@mounts)
       @server.start
+      @server.sync_ssh_keys(@ssh_keys)
     end
 
     def stop
@@ -163,8 +178,12 @@ module DevLXC
         return
       else
         puts "Creating container '#{@server.name}'"
-        if @server_type == 'adhoc'
-          platform_image = DevLXC.create_platform_image(@platform_image_name, @lxc_config_path)
+        if %w(adhoc compliance supermarket).include?(@server_type)
+          if @server_type == 'supermarket' && (@chef_server_bootstrap_backend && ! DevLXC::Container.new(@chef_server_bootstrap_backend, @lxc_config_path).defined?)
+            puts "ERROR: The bootstrap backend server '#{@chef_server_bootstrap_backend}' must be created first."
+            exit 1
+          end
+          platform_image = DevLXC.create_platform_image(@platform_image_name, @platform_image_options, @lxc_config_path)
           puts "Cloning platform image '#{platform_image.name}' into container '#{@server.name}'"
           platform_image.clone(@server.name, {:flags => LXC::LXC_CLONE_SNAPSHOT})
         else
@@ -194,6 +213,10 @@ module DevLXC
             DevLXC.create_dns_record(@analytics_fqdn, @server.name, @ipaddress)
           when 'chef-server'
             DevLXC.create_dns_record(@api_fqdn, @server.name, @ipaddress)
+          when 'compliance'
+            DevLXC.create_dns_record(@compliance_fqdn, @server.name, @ipaddress)
+          when 'supermarket'
+            DevLXC.create_dns_record(@supermarket_fqdn, @server.name, @ipaddress)
           end
         end
         @server.sync_mounts(@mounts)
@@ -205,7 +228,15 @@ module DevLXC
         @server.start
         # Allow adhoc servers time to generate SSH Server Host Keys
         sleep 5 if @server_type == 'adhoc'
+        case @server_type
+        when 'compliance'
+          @server.install_package(@packages["compliance"]) unless @packages["compliance"].nil?
+        when 'supermarket'
+          @server.install_package(@packages["supermarket"]) unless @packages["supermarket"].nil?
+        end
         configure_analytics if @server_type == 'analytics'
+        configure_compliance if @server_type == 'compliance'
+        configure_supermarket if @server_type == 'supermarket'
         if @server_type == 'chef-server' && ! @packages["server"].nil?
           configure_server
           create_users if @server.name == @chef_server_bootstrap_backend
@@ -216,9 +247,6 @@ module DevLXC
           unless @role == 'open-source'
             configure_reporting unless @packages["reporting"].nil?
             configure_push_jobs_server unless @packages["push-jobs-server"].nil?
-            if @analytics_bootstrap_backend && %w(standalone backend).include?(@role)
-              configure_chef_server_for_analytics
-            end
           end
         end
         @server.stop
@@ -233,7 +261,7 @@ module DevLXC
         puts "Using existing shared image '#{shared_image.name}'"
         return shared_image
       end
-      platform_image = DevLXC.create_platform_image(@platform_image_name, @lxc_config_path)
+      platform_image = DevLXC.create_platform_image(@platform_image_name, @platform_image_options, @lxc_config_path)
       puts "Cloning platform image '#{platform_image.name}' into shared image '#{shared_image.name}'"
       platform_image.clone(shared_image.name, {:flags => LXC::LXC_CLONE_SNAPSHOT})
       shared_image = DevLXC::Container.new(shared_image.name, @lxc_config_path)
@@ -261,7 +289,6 @@ module DevLXC
         shared_image.install_package(@packages["server"]) unless @packages["server"].nil?
         shared_image.install_package(@packages["reporting"]) unless @packages["reporting"].nil?
         shared_image.install_package(@packages["push-jobs-server"]) unless @packages["push-jobs-server"].nil?
-        shared_image.install_package(@packages["sync"]) unless @packages["sync"].nil?
       end
       shared_image.stop
       return shared_image
@@ -317,29 +344,6 @@ module DevLXC
       run_ctl("opscode-manage", "reconfigure")
     end
 
-    def configure_chef_server_for_analytics
-      puts "Configuring for Analytics"
-      case @chef_server_type
-      when 'private-chef'
-        DevLXC.append_line_to_file("#{@server.config_item('lxc.rootfs')}/etc/opscode/private-chef.rb",
-          "\noc_id['applications'] = {\n  'analytics' => {\n    'redirect_uri' => 'https://#{@analytics_fqdn}/'\n  }\n}\n")
-
-        DevLXC.append_line_to_file("#{@server.config_item('lxc.rootfs')}/etc/opscode/private-chef.rb",
-          "\nrabbitmq['vip'] = '#{@chef_server_bootstrap_backend}'\nrabbitmq['node_ip_address'] = '0.0.0.0'\n")
-      when 'chef-server-core'
-        DevLXC.append_line_to_file("#{@server.config_item('lxc.rootfs')}/etc/opscode/chef-server.rb",
-          "\noc_id['applications'] = {\n  'analytics' => {\n    'redirect_uri' => 'https://#{@analytics_fqdn}/'\n  }\n}\n")
-
-        DevLXC.append_line_to_file("#{@server.config_item('lxc.rootfs')}/etc/opscode/chef-server.rb",
-          "\nrabbitmq['vip'] = '#{@chef_server_bootstrap_backend}'\nrabbitmq['node_ip_address'] = '0.0.0.0'\n")
-      end
-
-      run_ctl(@server_ctl, "stop")
-      run_ctl(@server_ctl, "reconfigure")
-      run_ctl(@server_ctl, "restart")
-      run_ctl("opscode-manage", "reconfigure") if @role == 'frontend'
-    end
-
     def configure_analytics
       case @role
       when "standalone", "backend"
@@ -356,6 +360,25 @@ module DevLXC
       run_ctl("opscode-analytics", "reconfigure")
     end
 
+    def configure_compliance
+      run_ctl("chef-compliance", "reconfigure")
+    end
+
+    def configure_supermarket
+      if @chef_server_bootstrap_backend && DevLXC::Container.new(@chef_server_bootstrap_backend, @lxc_config_path).defined?
+        chef_server_supermarket_config = JSON.parse(IO.read("#{LXC::Container.new(@chef_server_bootstrap_backend, @lxc_config_path).config_item('lxc.rootfs')}/etc/opscode/oc-id-applications/supermarket.json"))
+        supermarket_config = {
+          'chef_server_url' => "https://#{@api_fqdn}/",
+          'chef_oauth2_app_id' => chef_server_supermarket_config['uid'],
+          'chef_oauth2_secret' => chef_server_supermarket_config['secret'],
+          'chef_oauth2_verify_ssl' => false
+        }
+        FileUtils.mkdir_p("#{@server.config_item('lxc.rootfs')}/etc/supermarket")
+        IO.write("#{@server.config_item('lxc.rootfs')}/etc/supermarket/supermarket.json", JSON.pretty_generate(supermarket_config))
+      end
+      run_ctl("supermarket", "reconfigure")
+    end
+
     def run_ctl(component, subcommand)
       puts "Running `#{component}-ctl #{subcommand}` in '#{@server.name}'"
       @server.run_command("#{component}-ctl #{subcommand}")
@@ -368,15 +391,16 @@ module DevLXC
       case @chef_server_type
       when 'chef-server'
         chef_server_url = "https://127.0.0.1"
-        username = "admin"
+        admin_username = "admin"
         validator_name = "chef-validator"
 
         FileUtils.cp( Dir.glob("#{@server.config_item('lxc.rootfs')}/etc/chef-server/{admin,chef-validator}.pem"), "#{@server.config_item('lxc.rootfs')}/root/chef-repo/.chef" )
       when 'private-chef', 'chef-server-core'
         chef_server_root = "https://127.0.0.1"
-        chef_server_url = "https://127.0.0.1/organizations/ponyville"
-        username = "rainbowdash"
-        validator_name = "ponyville-validator"
+        chef_server_url = "https://127.0.0.1/organizations/demo"
+        admin_username = "mary-admin"
+        username = "joe-user"
+        validator_name = "demo-validator"
 
         FileUtils.cp( "#{@server.config_item('lxc.rootfs')}/etc/opscode/pivotal.pem", "#{@server.config_item('lxc.rootfs')}/root/chef-repo/.chef" )
 
@@ -402,9 +426,16 @@ current_dir = File.dirname(__FILE__)
 
 chef_server_url "#{chef_server_url}"
 
-node_name "#{username}"
-client_key "\#{current_dir}/#{username}.pem"
+node_name "#{admin_username}"
+client_key "\#{current_dir}/#{admin_username}.pem"
+)
 
+      knife_rb += %Q(
+#node_name "#{username}"
+#client_key "\#{current_dir}/#{username}.pem"
+) unless username.nil?
+
+      knife_rb += %Q(
 validation_client_name "#{validator_name}"
 validation_key "\#{current_dir}/#{validator_name}.pem"
 
@@ -420,15 +451,19 @@ ssl_verify_mode :verify_none
         # give time for all services to come up completely
         sleep 60
         @server.run_command("/opt/opscode/embedded/bin/gem install knife-opc --no-ri --no-rdoc")
-        @server.run_command("/opt/opscode/embedded/bin/knife opc org create ponyville ponyville --filename /root/chef-repo/.chef/ponyville-validator.pem -c /root/chef-repo/.chef/pivotal.rb")
-        @server.run_command("/opt/opscode/embedded/bin/knife opc user create rainbowdash rainbowdash rainbowdash rainbowdash@noreply.com rainbowdash --filename /root/chef-repo/.chef/rainbowdash.pem -c /root/chef-repo/.chef/pivotal.rb")
-        @server.run_command("/opt/opscode/embedded/bin/knife opc org user add ponyville rainbowdash --admin -c /root/chef-repo/.chef/pivotal.rb")
+        @server.run_command("/opt/opscode/embedded/bin/knife opc org create demo demo --filename /root/chef-repo/.chef/demo-validator.pem -c /root/chef-repo/.chef/pivotal.rb")
+        @server.run_command("/opt/opscode/embedded/bin/knife opc user create mary-admin mary admin mary-admin@noreply.com mary-admin --filename /root/chef-repo/.chef/mary-admin.pem -c /root/chef-repo/.chef/pivotal.rb")
+        @server.run_command("/opt/opscode/embedded/bin/knife opc org user add demo mary-admin --admin -c /root/chef-repo/.chef/pivotal.rb")
+        @server.run_command("/opt/opscode/embedded/bin/knife opc user create joe-user joe user joe-user@noreply.com joe-user --filename /root/chef-repo/.chef/joe-user.pem -c /root/chef-repo/.chef/pivotal.rb")
+        @server.run_command("/opt/opscode/embedded/bin/knife opc org user add demo joe-user -c /root/chef-repo/.chef/pivotal.rb")
       when 'chef-server-core'
         # give time for all services to come up completely
         sleep 10
-        run_ctl(@server_ctl, "org-create ponyville ponyville --filename /root/chef-repo/.chef/ponyville-validator.pem")
-        run_ctl(@server_ctl, "user-create rainbowdash rainbowdash rainbowdash rainbowdash@noreply.com rainbowdash --filename /root/chef-repo/.chef/rainbowdash.pem")
-        run_ctl(@server_ctl, "org-user-add ponyville rainbowdash --admin")
+        run_ctl(@server_ctl, "org-create demo demo --filename /root/chef-repo/.chef/demo-validator.pem")
+        run_ctl(@server_ctl, "user-create mary-admin mary admin mary-admin@noreply.com mary-admin --filename /root/chef-repo/.chef/mary-admin.pem")
+        run_ctl(@server_ctl, "org-user-add demo mary-admin --admin")
+        run_ctl(@server_ctl, "user-create joe-user joe user joe-user@noreply.com joe-user --filename /root/chef-repo/.chef/joe-user.pem")
+        run_ctl(@server_ctl, "org-user-add demo joe-user")
       end
     end
   end
